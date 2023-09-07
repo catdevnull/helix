@@ -1,4 +1,8 @@
-use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt};
+use futures_util::{
+    future::{try_join_all, BoxFuture},
+    stream::FuturesUnordered,
+    FutureExt,
+};
 use helix_lsp::{
     block_on,
     lsp::{
@@ -1279,21 +1283,32 @@ pub fn signature_help_impl_with_future(
 pub fn hover(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
 
-    // TODO support multiple language servers (merge UI somehow)
-    let language_server =
-        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::Hover);
+    let language_servers = doc.language_servers_with_feature(LanguageServerFeature::Hover);
     // TODO: factor out a doc.position_identifier() that returns lsp::TextDocumentPositionIdentifier
-    let pos = doc.position(view.id, language_server.offset_encoding());
-    let future = language_server
-        .text_document_hover(doc.identifier(), pos, None)
-        .unwrap();
+    let results: Vec<_> = language_servers
+        .map(|ls| {
+            let pos = doc.position(view.id, ls.offset_encoding());
+            ls.text_document_hover(doc.identifier(), pos, None).unwrap()
+        })
+        .collect();
+    if results.len() == 0 {
+        cx.editor.set_status(format!(
+            "No configured language server supports {}",
+            LanguageServerFeature::Hover
+        ));
+        return;
+    }
+
+    // TODO don't wait for all servers to render hover if one already responded
+    let future = try_join_all(results).map(|r| match r {
+        Ok(rr) => Ok(serde_json::to_value(rr).unwrap()),
+        Err(e) => Err(e),
+    });
 
     cx.callback(
         future,
-        move |editor, compositor, response: Option<lsp::Hover>| {
-            if let Some(hover) = response {
-                // hover.contents / .range <- used for visualizing
-
+        move |editor, compositor, response: Vec<Option<lsp::Hover>>| {
+            let strings = response.into_iter().map(|res| {
                 fn marked_string_to_markdown(contents: lsp::MarkedString) -> String {
                     match contents {
                         lsp::MarkedString::String(contents) => contents,
@@ -1306,19 +1321,29 @@ pub fn hover(cx: &mut Context) {
                         }
                     }
                 }
+                match res {
+                    Some(hover) => {
+                        let contents = match hover.contents {
+                            lsp::HoverContents::Scalar(contents) => {
+                                marked_string_to_markdown(contents)
+                            }
+                            lsp::HoverContents::Array(contents) => contents
+                                .into_iter()
+                                .map(marked_string_to_markdown)
+                                .collect::<Vec<_>>()
+                                .join("\n\n"),
+                            lsp::HoverContents::Markup(contents) => contents.value,
+                        };
+                        contents
+                    }
+                    None => String::new(),
+                }
+            });
 
-                let contents = match hover.contents {
-                    lsp::HoverContents::Scalar(contents) => marked_string_to_markdown(contents),
-                    lsp::HoverContents::Array(contents) => contents
-                        .into_iter()
-                        .map(marked_string_to_markdown)
-                        .collect::<Vec<_>>()
-                        .join("\n\n"),
-                    lsp::HoverContents::Markup(contents) => contents.value,
-                };
-
-                // skip if contents empty
-
+            let mut contents = String::new();
+            // TODO surely this isn't the Correct Way to merge these comments and a dedicated UI would be nice
+            strings.for_each(|s| contents.push_str(&s));
+            if contents.len() > 0 {
                 let contents = ui::Markdown::new(contents, editor.syn_loader.clone());
                 let popup = Popup::new("hover", contents).auto_close(true);
                 compositor.replace_or_push("hover", popup);
